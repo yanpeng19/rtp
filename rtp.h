@@ -13,6 +13,7 @@
 #include <mutex>
 #include <utility>
 #include <algorithm>
+#include <memory>
 
 using namespace std;
 
@@ -122,7 +123,7 @@ private:
 };
 
 //rtp±¨ÎÄ
-
+ 
 class rtp_data
 {
 	friend bool operator==(const rtp_data&, const rtp_data&);
@@ -132,7 +133,7 @@ public:
 	rtp_data() = default;
 	rtp_data(const rtp_data& d);
 	rtp_data(bool _syn, bool _ack, bool _fin, unsigned long long _seq, int _len, const char* _data, rtp_addr send, rtp_addr recv);
-	~rtp_data() { if (len) delete[]data; }
+	~rtp_data();
 
 	size_t size() const { return min_rtp_data_size+len; };
 	unsigned long long get_seq() const { return seq; };

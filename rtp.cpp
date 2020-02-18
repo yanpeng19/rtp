@@ -43,8 +43,7 @@ const int size_char = sizeof(char);
 
 mutex m;
 mutex m_recv_cache;
-
-
+mutex m_seq;
 
 // rtp 相关
 rtp::rtp() : l_or_r(1)
@@ -163,9 +162,12 @@ bool operator==(const rtp_addr& r1, const rtp_addr& r2)
 // rtp_data 相关
 rtp_data::rtp_data(const rtp_data& d) :syn(d.syn), ack(d.ack), fin(d.fin), seq(d.seq), len(d.len),sender(d.sender), recver(d.recver)
 {
-	data = new char[len];
-	for (int i = 0; i < len; i++)
-		data[i] = d.data[i];
+	if (len)
+	{
+		data = new char[len];
+		for (int i = 0; i < len; i++)
+			data[i] = d.data[i];	
+	}
 }
 
 rtp_data::rtp_data(bool _syn, bool _ack, bool _fin, unsigned long long _seq,int _len, const char* _data, rtp_addr send, rtp_addr recv)
@@ -175,9 +177,29 @@ rtp_data::rtp_data(bool _syn, bool _ack, bool _fin, unsigned long long _seq,int 
 	if (len)
 	{
 		data = new char[len];
-		for (int i = 0; i < len; i++) data[i] = _data[i];
+		for (int i = 0; i < len; i++)
+			data[i] = _data[i];
 	}
 }
+
+rtp_data::~rtp_data()
+{
+	/*if (len)
+	{
+		memset(data, 1, len);
+		delete[] data;
+	}*/
+}
+
+
+//rtp_data::~rtp_data()
+//{
+//	if (len)
+//	{
+//		memset(data, 1, len);
+//		delete[] data;
+//	}
+//}
 
 bool operator==(const rtp_data& d1, const rtp_data& d2)
 {
@@ -222,6 +244,7 @@ deque<rtp_data> mes_list::transer_get(const size_t&i)
 	while (j > 0)
 	{
 		mes_list.pop_front();
+		time_list.pop_front();
 		j--;
 	}
 	return r;
@@ -263,6 +286,7 @@ void send_mes_list::countdown()
 		}
 		time(&now);
 	}
+	countdown_run = 0;
 }
 
 // mes_sender
@@ -310,9 +334,11 @@ unsigned int mes_sender::do_send()
 				else seq = rtp_control.get_right_send_seq(list[i].get_sender_identity(), list[i].get_recver_identity());
 				list[i].seq = seq;
 			}
-			return send(sender_rtp.get_socket(), list[i].data, list[i].len, 0);
+
+			char temp[1500] = { 0 };
+			int len = pack_rtp_data(temp, list[i], 1500);
+			return sendto(sender_rtp.get_socket(), temp, len, 0, (SOCKADDR*)&list[i].recver.get_sockaddr(), sizeof(SOCKADDR));
 		}
-		return 0;
 	}
 	return 0;
 }
@@ -330,11 +356,9 @@ void mes_sender::confirm_ack()
 			// 收到情况
 
 			// 发送区删除本报文,失败记录区
-
-			delete list[i].data;
-			list.erase(list.begin() + i);
 			fail_times.erase(list[i].get_seq());
-
+			list.erase(list.begin() + i);
+			
 			// 增加发送窗口
 			if (pack_loss) send_windows_size++;
 			else send_windows_size = +1 / send_windows_size;
@@ -355,7 +379,6 @@ void mes_sender::confirm_ack()
 				//20次发送失败，则从发送区剔除此数据包，并且将seq加入到优先级表中
 				fail_times[list[i].get_seq()] = 0;
 				seq_table.push_back(list[i].get_seq());
-				delete list[i].data;
 				list.erase(list.begin() + i);
 				i--;
 			}
@@ -367,19 +390,21 @@ void mes_sender::confirm_ack()
 void recv_mes_list::push_back(const rtp_data& data, const time_t& t)
 {
 	time(&timer);
+	string loc = data.recver.get_identity();
+	string rem = data.sender.get_identity();
 
-	unsigned long long right_seq = rtp_control.get_right_recv_seq(data.get_sender_identity(), data.get_recver_identity());
+	unsigned long long right_seq = rtp_control.get_right_recv_seq(loc,rem);
 	if (data.get_seq() == right_seq)
 	{
 		// seq正确 直接存储
 		mes_list::push_back(data, t);
-		rtp_control.add_right_recv_seq(data.get_sender_identity(), data.get_recver_identity());
+		rtp_control.add_right_recv_seq(loc, rem);
 		right_seq++;
 		while (recv_cache_list.find(right_seq) != recv_cache_list.end())
 		{
 			auto p = recv_cache_list[right_seq];
 			recv_cache_list.erase(right_seq);
-			rtp_control.add_right_recv_seq(data.get_sender_identity(), data.get_recver_identity());
+			rtp_control.add_right_recv_seq(loc, rem);
 			right_seq++;
 			mes_list::push_back(p.first, p.second);
 		}
@@ -415,7 +440,7 @@ void  recv_mes_list::countdown()
 	while (!recv_cache_list.empty())
 	{
 		time(&now);
-		if ((now - timer) > 60000)
+		if ((now - timer) > 60)
 		{
 			m_recv_cache.lock();
 			recv_cache_list.clear();
@@ -431,6 +456,8 @@ pair<unsigned long long, time_t> a_list::front()
 	if (empty()) return pair<unsigned long long , time_t>();
 	unsigned long long i = seq_list.front();
 	time_t t = time_list.front();
+	seq_list.pop_front();
+	time_list.pop_front();
 	return make_pair(i, t);
 }
 
@@ -657,7 +684,7 @@ bool rtp_system::inspection_ack(const string& ser, const string& cli, const unsi
 	time_t begin, end, now;
 	time(&begin);
 	time(&end);
-	unsigned long long right_seq = rtp_control.get_right_recv_seq(ser, cli);
+	unsigned long long right_seq = rtp_control.get_right_send_seq(ser, cli);
 
 	// 超时时间 3秒
 	while (end - begin < 3)
@@ -670,15 +697,8 @@ bool rtp_system::inspection_ack(const string& ser, const string& cli, const unsi
 		unsigned long long seq = p.first;
 
 		time(&now);
-		if (now - t < 15 && seq == right_seq)
-		{
-			if (seq_send_table[ser][cli] == INT_MAX) seq_send_table[ser][cli] = 0;
-			else seq_send_table[ser][cli]++;
-			if (seq_recv_table[ser][cli] == INT_MAX) seq_recv_table[ser][cli] = 0;
-			else seq_recv_table[ser][cli]++;
-
-			return 1;
-		}
+		if ((now - t) < 15 && seq == right_seq) return 1;
+		
 	}
 	return 0;
 }
@@ -894,12 +914,16 @@ void rtp_system::recv_list_push(const rtp& server, const rtp_data& data)
 	// seq 正确情况下发送ack报文，错误情况不做任何事情
 	if (data.get_seq() == right_seq)
 	{
+		// 此步会推入并且增加正确接受seq
 		recv_list[ser][cli]->push_back(data, now);
-		rtp_control.add_right_recv_seq(ser, cli);
+
 		rtp_data ack(0, 1, 0, data.get_seq(), 0, NULL, server.get_rpt_addr(), data.sender);
 		char buff[1500] = { 0 };
-		pack_rtp_data(buff, data, 1500);
-		sendto(server.get_socket(), buff, data.size(), 0, (SOCKADDR*)&data.sender, sizeof(SOCKADDR));
+		pack_rtp_data(buff, ack, 1500);
+
+		if (sendto(server.get_socket(), buff, data.size(), 0, (SOCKADDR*)&data.sender.get_sockaddr(), sizeof(SOCKADDR)) == -1)
+			cout << "send to error " << errno << endl;
+		
 	}
 	m.unlock();
 	return;
@@ -921,8 +945,9 @@ int rtp_system::send_mes(const rtp& remote, const rtp_data& data)
 		time_t now;
 		time(&now);
 		send_list[local->get_identity()][remote.get_identity()]->push_back(data, now);
+		m_seq.lock();
 		rtp_control.add_right_send_seq(local->get_identity(), remote.get_identity());
-
+		m_seq.unlock();
 		return data.size();
 	}
 	return -1;
@@ -1053,11 +1078,18 @@ void rtp_run(const rtp &server)
 		SOCKADDR_IN client;
   		int len = recvfrom(server.st, buff, 1500, 0, (SOCKADDR*)&client, &n);
 		
-		if (len == -1) continue;
+		if (len == -1)
+		{
+			Sleep(10);
+			continue;
+		}
 		rtp_data mes = unpack_rtp_data(buff, len,get_rtp_addr_from_addr_in(client));  // 此步骤包括rpt_data 包合法性检测
-		if (mes == DATA_ERROR) continue;
-
-		cout << "get mes from: " << (char*)inet_ntoa(client.sin_addr) << ":" << ntohs(client.sin_port) << " is a";
+		if (mes == DATA_ERROR)
+		{
+			Sleep(10);
+			continue;
+		}
+		cout << "get mes from: " << (char*)inet_ntoa(client.sin_addr) << ":" << ntohs(client.sin_port) << " is a ";
 		if (mes.syn && mes.ack) cout << "syn&&ack message" << endl;
 		else if (mes.syn && mes.fin) cout << "syn&&fin message" << endl;
 		else if (mes.syn) cout << "syn message" << endl;
