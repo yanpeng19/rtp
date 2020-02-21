@@ -52,6 +52,7 @@ extern const int size_char_p;
 extern const int size_char;
 
 extern mutex m;
+extern mutex m_data;
 extern mutex m_recv_cache;
 extern rtp_system rtp_control;
 
@@ -265,8 +266,8 @@ class a_list
 {
 public:
 	a_list() = default;
-	void push_back(const unsigned long long& seq, const time_t& t) { seq_list.push_back(seq); time_list.push_back(t); };
-	bool empty() { return  seq_list.empty(); };
+	void push_back(const unsigned long long& seq, const time_t& t) { m_data.lock(); seq_list.push_back(seq); time_list.push_back(t); m_data.unlock(); };
+	bool empty() { return  seq_list.empty()&&time_list.empty(); };
 	pair<unsigned long long, time_t> front();
 
 private:
@@ -330,6 +331,7 @@ public:
 
 	void set_state(const rtp&,const int&);
 	int get_state(const rtp&);
+	int get_state(const string&);
 
 	// 发送
 	int send_mes(const rtp& ender, const rtp_data& data);                      // 发送消息的实际步骤，对于发送队列的内容进行发送
@@ -351,7 +353,7 @@ private:
 	map <string, map<string, unsigned long long>> seq_send_table;         // 发送信息的正确序号
 	map <string, map<string, unsigned long long>> seq_recv_table;         // 接受信息的正确序号
 
-	map<SOCKET,int> state_table;                                          // SOCKET 状态表
+	map<string,int> state_table;                                          // SOCKET 状态表
 
 	// 消息发送表
 	map<string, const rtp*> sender_table;                                   // 发送消息时，根据发送表选择 使用哪个rtp来发送

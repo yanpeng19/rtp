@@ -7,7 +7,7 @@ using namespace std;
 
 const unsigned long MY_IP = inet_addr("127.0.0.1");
 
-
+#define DEBUG
 
 const int ERROR_STATE = 0;
 const int RTP_NEW = 20;         // 默认新建的状态，控制器不接收和发送 该rtp信息
@@ -44,6 +44,7 @@ const int size_char = sizeof(char);
 mutex m;
 mutex m_recv_cache;
 mutex m_seq;
+mutex m_data;
 
 // rtp 相关
 rtp::rtp() : l_or_r(1)
@@ -184,11 +185,12 @@ rtp_data::rtp_data(bool _syn, bool _ack, bool _fin, unsigned long long _seq,int 
 
 rtp_data::~rtp_data()
 {
-	/*if (len)
+	if (len)
 	{
-		memset(data, 1, len);
+		memset(data, 1, len - 1);
+		memset(data + len - 1, 0, 1);
 		delete[] data;
-	}*/
+	}
 }
 
 
@@ -216,24 +218,28 @@ bool operator==(const rtp_data& d1, const rtp_data& d2)
 // mes_list
 void mes_list::push_back(const rtp_data& mes, const time_t& t)
 {
+	m_data.lock();
 	mes_list.push_back(mes);
 	time_list.push_back(t);
 	s += mes.size();
+	m_data.unlock();
 }
 
 pair<rtp_data, time_t> mes_list::front()
 {
 	if (empty()) return pair<rtp_data, time_t>();
+	m_data.lock();
 	rtp_data mes = mes_list.front();
 	time_t t = time_list.front();
 	mes_list.pop_front();
 	time_list.pop_front();
+	m_data.unlock();
 	return make_pair(mes, t);
 }
 
 deque<rtp_data> mes_list::transer_get(const size_t&i)
 {
-	if (i > size())
+	if (i > mes_list.size())
 	{
 		deque<rtp_data> r(mes_list);
 		mes_list.clear();
@@ -271,22 +277,29 @@ void send_mes_list::countdown()
 	time(&now);
 
 	// 结束条件： 1.发送区为空  2.发送缓冲区为空  3.优先seq表为空
-	while (!sender.empty()||!mes_list::empty()||!sender.seq_table_empty())
+	while (!sender.empty() || !mes_list::empty() || !sender.seq_table_empty())
 	{
 		// 进行一次发送的条件，（发送缓冲区数据满5000 或者 0.2秒未推送数据） 或者 seq表非空
 
 		// 如果内容大于5000 或者 0.2秒未加入数据 那么进行一次发送,并确认ack 调整窗口大小
-		if (mes_list::size() > 5000|| (now - timer) > 0.2)
+
+		//cout << "countdown is run" << endl;
+		if (mes_list::size() > 5000 || (now - timer) > 0.2)
 		{
-			unsigned size = (sender.get_wz() - sender.size())>0?sender.get_wz()-sender.size():0;
+			unsigned size = (sender.get_wz() - sender.size()) > 0 ? sender.get_wz() - sender.size() : 0; // 需要发送的数据量  = 窗口大小-发送器中的数据
 			deque<rtp_data> temp = mes_list::transer_get(size);
 			sender.transfer_data(temp);
 			sender.do_send();
+			// 0.2秒内确认
+			Sleep(20);
 			sender.confirm_ack();
 		}
 		time(&now);
+		Sleep(20);
 	}
 	countdown_run = 0;
+	cout << "sender countdown_run end" << endl;
+	return;
 }
 
 // mes_sender
@@ -453,11 +466,23 @@ void  recv_mes_list::countdown()
 // a_list
 pair<unsigned long long, time_t> a_list::front()
 {
+	m_data.lock();
 	if (empty()) return pair<unsigned long long , time_t>();
+
+#ifdef DEBUG
+	if (time_list.empty())
+	{
+		cout << "time_list is empty,bug seq_list is not" << endl;
+		cout << time_list.size() << endl;
+	}
+#endif
+
+
 	unsigned long long i = seq_list.front();
 	time_t t = time_list.front();
 	seq_list.pop_front();
 	time_list.pop_front();
+	m_data.unlock();
 	return make_pair(i, t);
 }
 
@@ -474,7 +499,7 @@ void rtp_system::intilized_local(const rtp &server)
 	seq_recv_table[ser];
 	syn_fin_list[ser];
 	local_rtp_table[ser];
-	state_table[server.get_socket()];
+	state_table[ser];
 }
 
 int rtp_system::intilized_remote(const rtp &server,const rtp &client,const unsigned long long &send_seq,const  unsigned long long&recv_seq)
@@ -497,8 +522,8 @@ int rtp_system::intilized_remote(const rtp &server,const rtp &client,const unsig
 	seq_send_table[ser][cli] = send_seq;
 	seq_recv_table[ser][cli] = recv_seq;
 	sender_table[cli] = &server;
-	local_rtp_table[ser][cli] = &client;
-	state_table[client.get_socket()];
+	local_rtp_table[ser][cli] = new rtp(client);
+	state_table[cli];
 
 	return 1;
 }
@@ -506,7 +531,7 @@ int rtp_system::intilized_remote(const rtp &server,const rtp &client,const unsig
 void rtp_system::free_remote(const rtp &server,const rtp& client)
 {
 	// 释放一个客户端得资源
-
+	m.lock();
 	string ser = server.get_identity();
 	string cli = client.get_identity();
 
@@ -514,6 +539,7 @@ void rtp_system::free_remote(const rtp &server,const rtp& client)
 	delete send_list[ser][cli];
 	delete ack_list[ser][cli];
 	delete syn_fin_list[ser][cli];
+	delete local_rtp_table[ser][cli];
 
 	recv_list[ser][cli] = NULL;
 	send_list[ser][cli] = NULL;
@@ -527,7 +553,8 @@ void rtp_system::free_remote(const rtp &server,const rtp& client)
 	seq_recv_table[ser].erase(cli);
 	sender_table.erase(cli);
 	local_rtp_table[ser].erase(cli);
-	state_table.erase(client.get_socket());
+	state_table.erase(client.get_identity());
+	m.unlock();
 }
 
 void rtp_system::free_local(const rtp &server)
@@ -572,7 +599,7 @@ void rtp_system::free_local(const rtp &server)
 	seq_recv_table.erase(ser);
 
 	local_rtp_table.erase(ser);
-	state_table.erase(server.get_socket());
+	state_table.erase(ser);
 }
 
 bool rtp_system::is_intilized_local(const string& local) const
@@ -661,7 +688,7 @@ pair<rtp, unsigned long long> rtp_system::get_rtp_from_connce_list(const rtp &se
 	return make_pair(RTP_ERROR, 0);
 }
 
-bool rtp_system::inspection_ack(const rtp& server, const rtp& client,const unsigned long long & sent_seq)
+bool rtp_system::inspection_ack(const rtp& server, const rtp& client,const unsigned long long & right_seq)
 {
 	if (!rtp_control.is_intilized_local(server)) return 0;
 	string ser = server.get_identity();
@@ -669,35 +696,70 @@ bool rtp_system::inspection_ack(const rtp& server, const rtp& client,const unsig
 
 	if (ack_list[ser].find(cli) == ack_list[ser].end()) return 0;
 
-	time_t begin, end, now;
+	time_t begin, now;
 	time(&begin);
-	time(&end);
-	
-	return !ack_list[ser][cli]->empty();
+	time(&now);
 
-}
-
-bool rtp_system::inspection_ack(const string& ser, const string& cli, const unsigned long long& seq)
-{
-	if (ack_list[ser].find(cli) == ack_list[ser].end()) return 0;
-
-	time_t begin, end, now;
-	time(&begin);
-	time(&end);
-	unsigned long long right_seq = rtp_control.get_right_send_seq(ser, cli);
+	//unsigned long long right_seq = rtp_control.get_right_recv_seq(server, client);
 
 	// 超时时间 3秒
-	while (end - begin < 3)
+	while ((now - begin) < 3)
 	{
+		time(&now);
 		auto cl = ack_list[ser][cli];
-		if (cl->empty()) continue;
-
+		if (cl->empty())
+		{
+			Sleep(10);
+			continue;
+		}
 		pair<unsigned long long, time_t> p = cl->front();
 		time_t t = p.second;
 		unsigned long long seq = p.first;
 
 		time(&now);
-		if ((now - t) < 15 && seq == right_seq) return 1;
+		if (now - t < 15 && seq == right_seq)
+		{
+			/*if (seq_send_table[ser][cli] == ULLONG_MAX) seq_send_table[ser][cli] = 0;
+			else seq_send_table[ser][cli]++;*/
+			/*if (seq_recv_table[ser][cli] == ULLONG_MAX) seq_recv_table[ser][cli] = 0;
+			else seq_recv_table[ser][cli]++;*/
+
+			return 1;
+		}
+	}
+	return 0;
+}
+
+bool rtp_system::inspection_ack(const string& ser, const string& cli, const unsigned long long& right_seq)
+{
+	if (ack_list[ser].find(cli) == ack_list[ser].end()) return 0;
+
+	time_t begin, now;
+	time(&begin);
+	time(&now);
+
+	// 超时时间 3秒
+	while ((now - begin) < 3)
+	{
+		time(&now);
+		auto cl = ack_list[ser][cli];
+		if (cl->empty()) continue;
+		m.lock();
+		pair<unsigned long long, time_t> p = cl->front();
+		m.unlock();
+		time_t t = p.second;
+		unsigned long long seq = p.first;
+
+		time(&now);
+		if (now - t < 15 && seq == right_seq)
+		{
+			/*if (seq_send_table[ser][cli] == ULLONG_MAX) seq_send_table[ser][cli] = 0;
+			else seq_send_table[ser][cli]++;*/
+			/*if (seq_recv_table[ser][cli] == ULLONG_MAX) seq_recv_table[ser][cli] = 0;
+			else seq_recv_table[ser][cli]++;*/
+
+			return 1;
+		}
 		
 	}
 	return 0;
@@ -715,11 +777,15 @@ unsigned long long rtp_system::client_inspection_syn(const rtp& local, const rtp
 
 	// 已经发送了第一次syn 需要确认对方是否发来 syn 
 	if (syn_fin_list[loc][rem]->empty()) return SEQ_ERROR;
-	auto p = syn_fin_list[loc][rem]->front();
-	auto data = p.first;
 
+	m.lock();
+	auto p = syn_fin_list[loc][rem]->front();
+	m.unlock();
+	auto data = p.first;
+	char temp[1500] = { 0 };
+	memcpy(temp, data.data, data.len);
 	stringstream ss;
-	ss << data.data;
+	ss << temp;
 	// 读取出 对方发来的seq
 	return stoull(ss.str());
 }
@@ -736,6 +802,9 @@ unsigned long long rtp_system::client_inspection_fin(const rtp& local, const rtp
 	if (syn_fin_list[loc][rem]->empty()) return SEQ_ERROR;
 	auto p = syn_fin_list[loc][rem]->front();
 	auto data = p.first;
+
+	if (data.len == 0)
+		return 1;
 
 	stringstream ss;
 	ss << data.data;
@@ -768,7 +837,7 @@ void rtp_system::client_push_syn_fin(const string& local, const string& remote, 
 	auto rtp_local = get_send_rtp(remote);
 
 	if ((rtp_remote->state() == RTP_SYN_SENT && data.syn && data.ack) ||
-		(rtp_remote->state() == RTP_FIN_SEND && data.fin && data.ack))
+		(rtp_remote->state() == RTP_FIN_SEND && data.fin))
 	{
 		time_t now;
 		time(&now);
@@ -848,15 +917,21 @@ void rtp_system::set_recv_seq(const rtp& local, const rtp& remot, const unsigned
 void rtp_system::set_state(const rtp& ender, const int& sta)
 {
 	if ( find(v_state.begin(), v_state.end(), sta) == v_state.end()) return;
-	auto p = state_table.find(ender.get_socket());
+	auto p = state_table.find(ender.get_identity());
 	if (p == state_table.end()) return;
-	state_table[ender.get_socket()] = sta;
+	state_table[ender.get_identity()] = sta;
 }
 
 int rtp_system::get_state(const rtp& ender)
 {
-	if (state_table.find(ender.get_socket()) == state_table.end()) return ERROR_STATE;
-	else return state_table[ender.get_socket()];
+	if (state_table.find(ender.get_identity()) == state_table.end()) return ERROR_STATE;
+	else return state_table[ender.get_identity()];
+}
+
+int rtp_system::get_state(const string& id)
+{
+	if (state_table.find(id) == state_table.end()) return ERROR_STATE;
+	return state_table[id];
 }
 
 unsigned long long rtp_system::get_right_send_seq(const rtp& local, const rtp& remote)
@@ -1024,9 +1099,10 @@ rtp rtp_accept(const rtp& server)
 	{
 		if (!rtp_control.connect_list_empty(server))
 		{
-			auto client = local_three_handshake(server);
-			if (client != RTP_ERROR) return client;
+			return local_three_handshake(server);
+
 		}
+		Sleep(10);
 		time(&end);
 	}
 return RTP_ERROR;
@@ -1089,14 +1165,16 @@ void rtp_run(const rtp &server)
 			Sleep(10);
 			continue;
 		}
+
+		m.lock();
 		cout << "get mes from: " << (char*)inet_ntoa(client.sin_addr) << ":" << ntohs(client.sin_port) << " is a ";
 		if (mes.syn && mes.ack) cout << "syn&&ack message" << endl;
 		else if (mes.syn && mes.fin) cout << "syn&&fin message" << endl;
 		else if (mes.syn) cout << "syn message" << endl;
 		else if (mes.ack) cout << "ack message" << endl;
-		else if (mes.fin) cout << "mes message" << endl;
+		else if (mes.fin) cout << "fin message" << endl;
 		else cout << "normol message" << endl;
-		
+		m.unlock();
 		mes.sender = get_rtp_addr_from_addr_in(client);
 
 		if (mes.ack)
@@ -1108,9 +1186,19 @@ void rtp_run(const rtp &server)
 			}
 			else rtp_control.ack_list_push(server, mes);   // 普通 ack 消息
 		}
-		else if (mes.fin) local_four_handshake(server, mes);   // 接受消息
+		else if (mes.fin)
+		{
+			auto remote_id = mes.sender.get_identity();
+			if (!rtp_control.is_intilized_remote(server.get_identity(), remote_id))
+				continue;
+			
+			if(rtp_control.get_state(remote_id)==RTP_FIN_SEND) // 4次握手中的第二次消息
+				rtp_control.client_push_syn_fin(server.get_identity(), remote_id, mes);
+			else local_four_handshake(server, mes);  // 4次握手中的第一次
+		}
 		else if (mes.syn) rtp_control.connect_list_push(server, mes); // syn 消息
 		else rtp_control.recv_list_push(server, mes);  // 普通消息
+		
 	}
 	return;
 }
@@ -1123,14 +1211,11 @@ rtp local_three_handshake(const rtp &server)
 	// 检查握手队列是否有 合法的握手对象
 	// 有则进入之后的握手步骤-> 发送消息 -> 确认ack 
 
-
-
 	// rtp 控制器 甩出一个 rtp
 	auto r = rtp_control.get_rtp_from_connce_list(server);
-	
-	auto r_temp = r.first;
-	if (r_temp == RTP_ERROR) return RTP_ERROR;
+	rtp* r_temp = new rtp(r.first);
 
+	if (*r_temp == RTP_ERROR) return RTP_ERROR;
 
 	// 临时rtp 合法,为其分配资源，并且进行握手动作
 	time_t now;
@@ -1141,10 +1226,10 @@ rtp local_three_handshake(const rtp &server)
 	time(&syn_time);
 
 	unsigned long long send_seq = r.second;
-	unsigned long long recv_seq = rand();
+	unsigned long long recv_seq = now%rand();
 	//分配资源
-	rtp_control.intilized_remote(server,r_temp,send_seq,recv_seq);
-	r_temp.set_state(RTP_SYN_SENT);
+	rtp_control.intilized_remote(server,*r_temp,send_seq,recv_seq);
+	r_temp->set_state(RTP_SYN_SENT);
 
 	stringstream ss;
 	ss << recv_seq;
@@ -1153,25 +1238,32 @@ rtp local_three_handshake(const rtp &server)
 	for (size_t i = 0; i < recv_num.size(); i++)
 		seq_buff[i] = recv_num[i]; 
 
-	rtp_data mes(1,1, 0, send_seq, recv_num.size(), seq_buff, rtp_addr(), r_temp.get_rpt_addr());      // 生成一个 带有接受序号 的第二次握手 报文
+	rtp_data mes(1,1, 0, send_seq, recv_num.size(), seq_buff, rtp_addr(), r_temp->get_rpt_addr());      // 服务器生成一个 带有接受序号 的第二次握手 报文
 	char buff[1500] = { 0 };
 
 	pack_rtp_data(buff, mes, 1500);
-	SOCKADDR_IN addr = r_temp.get_rpt_addr().get_sockaddr();
+	SOCKADDR_IN addr = r_temp->get_rpt_addr().get_sockaddr();
 	// 握手10秒超时
 	while ((now - syn_time) < 10)
 	{
 		int i = sendto(server.get_socket(), buff, mes.size(), 0, (SOCKADDR*)&addr, sizeof(SOCKADDR));
-		if (!rtp_control.inspection_ack(server,r_temp,send_seq)) continue;                       // 然后检查ack 队列，是否对方对第二次进行了确认
-
+		if (!rtp_control.inspection_ack(server, *r_temp, send_seq))
+		{
+			Sleep(1000);// 然后检查ack 队列，是否对方对第二次报文进行了确认,1秒一次
+			time(&now);
+			continue;
+		}
 		// 状态就绪，并且返回
-		r_temp.set_state(RTP_RIGHT);
-		rtp_control.clear_syn_fin(server,r_temp);
-		return r_temp;
+		r_temp->set_state(RTP_RIGHT);
+		rtp_control.clear_syn_fin(server,*r_temp);
+		auto r = *r_temp;
+		delete r_temp;
+		return r;
 	}
 
 	// 失败则释放资源
-	rtp_control.free_remote(server, r_temp);
+	rtp_control.free_remote(server, *r_temp);
+	delete r_temp;
 	return RTP_ERROR;
 }
 
@@ -1219,15 +1311,18 @@ rtp remote_three_handshake(const rtp& local,const rtp_addr& addr)
 			send_seq = rtp_control.client_inspection_syn(local, server);
 			if (send_seq!=SEQ_ERROR)
 			{
-				rtp_data ack_data(0, 1, 0, send_seq, 0, NULL, local.get_rpt_addr(), addr); // 声明一份 ack 数据报
+				rtp_data ack_data(0, 1, 0, recv_seq, 0, NULL, local.get_rpt_addr(), addr); // 声明一份 ack 数据报
 				memset(buff, 0, 1500);
 				len = pack_rtp_data(buff, ack_data, ack_data.size());
 				rtp_control.set_send_seq(local, server, send_seq);
 
+				cout << "connect " << server.get_identity() << " succes" << endl;
+
 				//发送ack，并且结束
-				send(server.get_socket(), buff, len, 0);
+				sendto(local.get_socket(), buff, len, 0, (SOCKADDR*)&addr.get_sockaddr(), sizeof(SOCKADDR));
 				return server;
 			}
+			Sleep(10);
 		}
 	}
 	rtp_control.free_remote(local, server);
@@ -1241,20 +1336,16 @@ rtp rtp_connect(const rtp& local,const rtp_addr &addr)
 	// 1，3, 5, 7, 9 秒分别重试
 	// 握手成功后 服务器返还
 	time_t begin, end;
-	int time_end = 1;
 
 	time(&begin);
 	time(&end);
 	
 	while (end - begin < 10)
 	{
-		if (end - begin < time_end)
-		{
-			rtp server = remote_three_handshake(local,addr);
-			if (server != RTP_ERROR) return server;
-		}
 		time(&end);
-		if (end - begin > time_end) time_end += 2;
+		rtp server = remote_three_handshake(local,addr);
+		if (server != RTP_ERROR) return server;
+		Sleep(2000);
 	}
 	return RTP_ERROR;
 }
@@ -1304,11 +1395,13 @@ int rtp_shutdown(const rtp& ender)
 
 			for (auto p : local_map)
 			{
-				unsigned long long right_seq = rtp_control.get_right_send_seq(ender.get_identity(), p.second->get_identity());
+				/*unsigned long long right_seq = rtp_control.get_right_send_seq(ender.get_identity(), p.second->get_identity());
 				rtp_data fin(0, 0, 1, right_seq, 0, NULL, ender.get_rpt_addr(), p.second->get_rpt_addr());
 				char buff[1500] = { 0 };
 				pack_rtp_data(buff, fin, 1500);
-				send(ender.get_socket(), buff, fin.size(), 0);
+				send(ender.get_socket(), buff, fin.size(), 0);*/
+				thread t(&rtp_shutdown, *p.second);
+				t.detach();
 			}
 			Sleep(30000);
 		}
@@ -1317,8 +1410,7 @@ int rtp_shutdown(const rtp& ender)
 	{
 		auto local = rtp_control.get_send_rtp(ender.get_identity());
 		if (*local == RTP_ERROR) return 0;
-
-		rtp_control.free_remote(*local,ender);
+		remote_four_handshake(*local, ender);
 	}
 	return 0;
 }
@@ -1340,41 +1432,39 @@ void local_four_handshake(const rtp& local,rtp& remote)
 	if (!rtp_control.is_intilized_local(local) || !rtp_control.is_intilized_remote(local, remote)) return;
 
 	// 生成对 fin_ack 的报文, 以及fin 报文
-	unsigned long long last_recv_seq = rtp_control.get_right_recv_seq(local.get_identity(), remote.get_identity()) - 1;
+	unsigned long long last_recv_seq = rtp_control.get_right_recv_seq(local.get_identity(), remote.get_identity());
 	unsigned long long send_seq = rtp_control.get_right_send_seq(local.get_identity(), remote.get_identity());
-	rtp_data fin_ack(0, 1, 1, last_recv_seq, 0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
+
+	// 报文ack
+	rtp_data fin_ack(0, 1, 0, last_recv_seq, 0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
+	// 第二次报文
 	rtp_data fin_data(0, 0, 1,send_seq,0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
 
 	time_t begin, now;
 	time(&begin);
 	time(&now);
-	int end_time = 1000;
+	int end_time = 10;
 	remote.set_state(RTP_FIN_SEND);
 
-	while ((now - begin) < 150000 && (now - begin) < end_time)
+	while ((now - begin) < 15)
 	{
+		time(&now);
 		char buff[1500] = { 0 };
 		pack_rtp_data(buff, fin_ack,1500);
-		send(remote.get_socket(), buff, fin_ack.size(), 0);
+		sendto(local.get_socket(), buff, fin_ack.size(), 0,(SOCKADDR*)&remote.get_rpt_addr().get_sockaddr(),sizeof(SOCKADDR));
+
 		memset(buff, 0, 1500);
 		pack_rtp_data(buff, fin_data,1500);
-		send(remote.get_socket(), buff, fin_ack.size(), 0);
-
-		while ((now - begin) < end_time)
-		{
-			//检查是否收到 最后fin的ack
-			if (rtp_control.inspection_ack(local, remote,send_seq))
-			{
-				//收到则释放资源
-				m.lock();
-				rtp_control.free_remote(local,remote);
-				m.unlock();
-				return;
-			}
-			time(&now);
-		}
+		sendto(local.get_socket(), buff, fin_ack.size(), 0, (SOCKADDR*)&remote.get_rpt_addr().get_sockaddr(), sizeof(SOCKADDR));
+		
 		time(&now);
-		end_time += 2;
+		//检查是否收到 最后fin的ack
+		if (rtp_control.inspection_ack(local, remote, send_seq))
+		{
+			//收到则释放资源
+			rtp_control.free_remote(local, remote);
+			return;
+		}
 	}
 	m.lock();
 	rtp_control.free_remote(local, remote);
@@ -1406,7 +1496,6 @@ void remote_four_handshake(const rtp& local,const rtp& remote)
 	time_t begin, now;
 	time(&begin);
 	time(&now);
-	int end_time = 1000;
 
 	// fin 报文
 	unsigned long long right_send_seq = rtp_control.get_right_send_seq(local.get_identity(), remote.get_identity());
@@ -1415,39 +1504,41 @@ void remote_four_handshake(const rtp& local,const rtp& remote)
 	rtp_data fin(0, 0, 1, right_send_seq, 0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
 
 	// 15秒超时
-	while ((now - begin) < 15000)
+	while ((now - begin) < 15)
 	{
-		while ((now - begin) < end_time)
+		char buff[1500] = { 0 };
+		pack_rtp_data(buff, fin, fin.size());
+
+		// 发送fin
+		sendto(local.get_socket(), buff, fin.size(), 0, (SOCKADDR*)&remote.get_rpt_addr().get_sockaddr(), sizeof(SOCKADDR));
+		remote.set_state(RTP_FIN_SEND);
+		// 循环等待ack
+		if (rtp_control.inspection_ack(local, remote, right_send_seq))
 		{
-			char buff[1500] = { 0 };
-			pack_rtp_data(buff, fin,fin.size());
-
-			// 发送fin
-			send(remote.get_socket(), buff, fin.size(), 0);
-			remote.set_state(RTP_FIN_SEND);
-			while ((now - begin) < end_time)
+			// 等待对方的fin报文
+			while ((now - begin) < 15)
 			{
-				// 循环等待ack
-				if (rtp_control.inspection_ack(local.get_identity(), remote.get_identity(), right_send_seq))
-				{
-					// 等待对方的fin报文
-					unsigned long long fin_ack_seq = rtp_control.client_inspection_fin(local, remote);
-					time(&now);
-					if (fin_ack_seq == SEQ_ERROR) continue;
-
-					// 收到fin 后发送ack 报文
-					rtp_data fin_ack(0, 1, 1, fin_ack_seq, 0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
-					memset(buff, 0, 1500);
-					pack_rtp_data(buff, fin_ack, fin_ack.size());
-					send(remote.get_socket(), buff, fin_ack.size(), 0);
-
-					rtp_control.free_remote(local, remote);
-					return;
-				}
 				time(&now);
+				unsigned long long fin_ack_seq = rtp_control.client_inspection_fin(local, remote);
+				time(&now);
+				if (fin_ack_seq == SEQ_ERROR)
+				{
+					Sleep(100);
+					continue;
+				}
+
+				// 收到fin 后发送ack 报文
+				rtp_data fin_ack(0,1, 0, fin_ack_seq, 0, NULL, local.get_rpt_addr(), remote.get_rpt_addr());
+				memset(buff, 0, 1500);
+				pack_rtp_data(buff, fin_ack, fin_ack.size());
+				sendto(local.get_socket(), buff, fin_ack.size(), 0, (SOCKADDR*)&remote.get_rpt_addr().get_sockaddr(), sizeof(SOCKADDR));
+
+				rtp_control.free_remote(local, remote);
+				return;
 			}
-			time(&now);
+
 		}
+		Sleep(1000);
 		time(&now);
 	}
 
